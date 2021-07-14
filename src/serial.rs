@@ -17,6 +17,8 @@ use crate::{
     time::rate::*,
 };
 
+use config::*;
+
 #[allow(unused_imports)]
 use crate::pac::RCC;
 
@@ -35,6 +37,101 @@ pub enum Event {
     Tc,
     /// Idle line state detected
     Idle,
+}
+
+pub mod config {
+    use crate::time::rate::*;
+
+    pub enum WordLength {
+        DataBits7,
+        DataBits8,
+        DataBits9,
+    }
+
+    pub enum Parity {
+        ParityNone,
+        ParityEven,
+        ParityOdd,
+    }
+
+    pub enum StopBits {
+        #[doc = "1 stop bit"]
+        STOP1,
+        #[doc = "0.5 stop bits"]
+        STOP0P5,
+        #[doc = "2 stop bits"]
+        STOP2,
+        #[doc = "1.5 stop bits"]
+        STOP1P5,
+    }
+
+    pub enum DmaConfig {
+        None,
+        Tx,
+        Rx,
+        TxRx,
+    }
+
+    pub struct Config {
+        pub baudrate: Baud,
+        pub wordlength: WordLength,
+        pub parity: Parity,
+        pub stopbits: StopBits,
+        pub dma: DmaConfig,
+    }
+
+    impl Config {
+        pub fn baudrate(mut self, baudrate: Baud) -> Self {
+            self.baudrate = baudrate;
+            self
+        }
+
+        pub fn parity_none(mut self) -> Self {
+            self.parity = Parity::ParityNone;
+            self
+        }
+
+        pub fn parity_even(mut self) -> Self {
+            self.parity = Parity::ParityEven;
+            self
+        }
+
+        pub fn parity_odd(mut self) -> Self {
+            self.parity = Parity::ParityOdd;
+            self
+        }
+
+        pub fn wordlength_8(mut self) -> Self {
+            self.wordlength = WordLength::DataBits8;
+            self
+        }
+
+        pub fn wordlength_9(mut self) -> Self {
+            self.wordlength = WordLength::DataBits9;
+            self
+        }
+
+        pub fn stopbits(mut self, stopbits: StopBits) -> Self {
+            self.stopbits = stopbits;
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct InvalidConfig;
+
+    impl Default for Config {
+        fn default() -> Config {
+            let baudrate = 19200.Bd();
+            Config {
+                baudrate,
+                wordlength: WordLength::DataBits8,
+                parity: Parity::ParityNone,
+                stopbits: StopBits::STOP1,
+                dma: DmaConfig::None,
+            }
+        }
+    }
 }
 
 /// Serial error
@@ -214,10 +311,11 @@ where
     pub fn new(
         usart: Usart,
         pins: (Tx, Rx),
-        baud_rate: Baud,
+        config: Config,
+        // baud_rate: Baud,
         clocks: Clocks,
         apb: &mut <Usart as Instance>::APB,
-    ) -> Self
+    ) -> Result<Self, config::InvalidConfig>
     where
         Usart: Instance,
         Tx: TxPin<Usart>,
@@ -225,9 +323,21 @@ where
     {
         Usart::enable_clock(apb);
 
-        let brr = Usart::clock(&clocks).integer() / baud_rate.integer();
+        let brr = Usart::clock(&clocks).integer() / config.baudrate.integer();
         crate::assert!(brr >= 16, "impossible baud rate");
         usart.brr.write(|w| w.brr().bits(brr as u16));
+
+        usart.cr1.modify(|_, w| {
+            w.m()
+                .bit(match config.wordlength {
+                    WordLength::DataBits9 => true,
+                    WordLength::DataBits7 | WordLength::DataBits8 => false,
+                })
+                .pce()
+                .bit(!matches!(config.parity, Parity::ParityNone))
+                .ps()
+                .bit(matches!(config.parity, Parity::ParityOdd))
+        });
 
         usart.cr1.modify(|_, w| {
             w.ue().enabled(); // enable USART
@@ -235,7 +345,21 @@ where
             w.te().enabled() // enable transmitter
         });
 
-        Self { usart, pins }
+        match config.dma {
+            DmaConfig::None => {},
+            DmaConfig::Tx => usart.cr3.modify(|_, w| w.dmat().enabled()),
+            DmaConfig::Rx => usart.cr3.modify(|_, w| w.dmar().enabled()),
+            DmaConfig::TxRx => usart.cr3.modify(|_, w| w.dmat().enabled().dmar().enabled()),
+        }
+
+        usart.cr2.modify(|_, w| w.stop().bits(match config.stopbits {
+            StopBits::STOP0P5 => 0b01,
+            StopBits::STOP1 => 0b00,
+            StopBits::STOP1P5 => 0b11,
+            StopBits::STOP2 => 10,
+        }));
+
+        Ok(Self { usart, pins })
     }
 
     /// Starts listening for an interrupt event
