@@ -1,4 +1,4 @@
-use core::mem::size_of;
+use core::{fmt::Debug, mem::size_of};
 
 use crate::pac::{flash, FLASH};
 
@@ -9,7 +9,7 @@ pub const SZ_1K: usize = 1024;
 
 
 pub trait FlashWriteErase {
-    type WriteEraseError;
+    type WriteEraseError: Debug;
 
     unsafe fn page_erase(&mut self, start_offset: usize) -> Result<(), Self::WriteEraseError>;
 
@@ -20,7 +20,7 @@ pub trait FlashWriteErase {
 }
 
 pub trait FlashRead {
-    type ReadError;
+    type ReadError: Debug;
     unsafe fn read(&self, offset: usize, buf: &mut [u8]) -> Result<(), Self::ReadError>;
 }
 
