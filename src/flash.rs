@@ -2,31 +2,68 @@ use core::{fmt::Debug, mem::size_of};
 
 use crate::pac::{flash, FLASH};
 
-pub const FLASH_START: usize = 0x0800_0000;
-pub const FLASH_END_MAX: usize = 0x0807_FFFF;
+pub const FLASH_START: u32 = 0x0800_0000;
+pub const FLASH_END_MAX: u32 = 0x0807_FFFF;
 
-pub const SZ_1K: usize = 1024;
+pub const SZ_1K: u32 = 1024;
 
+
+// pub trait FlashWriteErase {
+//     type WriteEraseError: Debug;
+
+//     unsafe fn page_erase(&mut self, start_offset: usize) -> Result<(), Self::WriteEraseError>;
+
+//     /// Writes bytes in data slice to flash, starting from offset.
+//     /// The implementation has to check that data.len is an integer multiple of the smallest possible write.
+//     /// If not it should return LengthNotMultipleSmallest Error
+//     unsafe fn write(&mut self, offset: usize, buf: &[u8]) -> Result<(), Self::WriteEraseError>;
+// }
 
 pub trait FlashWriteErase {
+    /// The smallest chunk writable in amount of bytes
+    const WRITESIZE: u32;
+    /// The smallest chunk erasable in amount of bytes (Also called erase sector size)
+    const ERASESIZE: u32;
+    /// The type of error that can occur when writing or erasing
     type WriteEraseError: Debug;
 
-    unsafe fn page_erase(&mut self, start_offset: usize) -> Result<(), Self::WriteEraseError>;
+    /// Erases all erase sectors "touched" by the range of the given length starting at the given offset
+    ///
+    /// Returns 'Ok(())' if the operation was successful and an error if the operation is invalid based on the given arguments or didn't succeed
+    ///
+    /// # Safety
+    ///
+    /// When calling this method it must be made sure to not erase part of the running application
+    unsafe fn erase(&mut self, offset: u32, length: u32) -> Result<(), Self::WriteEraseError>;
 
-    /// Writes bytes in data slice to flash, starting from offset.
-    /// The implementation has to check that data.len is an integer multiple of the smallest possible write.
-    /// If not it should return LengthNotMultipleSmallest Error
-    unsafe fn write(&mut self, offset: usize, buf: &[u8]) -> Result<(), Self::WriteEraseError>;
+    /// Writes bytes in buffer slice to flash, starting from offset.
+    /// If the buffer length is no integer multiple of ['WRITESIZE'](FlashWriteErase::WRITESIZE), the data is padded by the appropriate amount
+    ///
+    /// # Safety
+    ///
+    /// When calling this method it must be made sure to not reprogram part of the running application
+    unsafe fn write(&mut self, offset: u32, buffer: &[u8]) -> Result<(), Self::WriteEraseError>;
 }
+
+// pub trait FlashRead {
+//     type ReadError: Debug;
+//     unsafe fn read(&self, offset: usize, buf: &mut [u8]) -> Result<(), Self::ReadError>;
+// }
 
 pub trait FlashRead {
+    /// The smallest chunk readable in amount of bytes
+    const READSIZE: u32;
+    /// The type of error that can occur when reading
     type ReadError: Debug;
-    unsafe fn read(&self, offset: usize, buf: &mut [u8]) -> Result<(), Self::ReadError>;
+
+    /// Reads data from offset into the provided buffer
+    fn read(&self, offset: u32, buffer: &mut [u8]) -> Result<(), Self::ReadError>;
 }
 
+
 pub struct FlashLayout {
-    pub flash_size: usize,
-    pub sector_size: usize,
+    pub flash_size: u32,
+    pub sector_size: u32,
 }
 
 // #[cfg(feature = "flash-256_2")]
@@ -61,21 +98,17 @@ impl<'a> FlashWriter<'a> {
     const KEY1: u32 = 0x45670123;
     const KEY2: u32 = 0xCDEF89AB;
 
-    const WRITESIZE: usize = 2;
-
-    fn valid_write_length(&self, offset: usize, length: usize) -> Result<(), Error> {
+    fn valid_write_length(&self, offset: u32, length: u32) -> Result<(), Error> {
         if offset + length > FLASH_LAYOUT.flash_size {
-            Err(Error::LengthTooLong)
+            Err(Error::OutOfBounds)
         } else if offset % Self::WRITESIZE != 0 {
             Err(Error::AddressMisaligned)
-        // } else if length % Self::WRITESIZE != 0 {
-        //     Err(Error::LengthNotMultipleSmallest)
         } else {
             Ok(())
         }
     }
 
-    fn valid_read_length(&self, offset: usize, length: usize) -> Result<(), Error> {
+    fn valid_read_length(&self, offset: u32, length: u32) -> Result<(), Error> {
         if offset + length > FLASH_LAYOUT.flash_size {
             Err(Error::OutOfBounds)
         } else {
@@ -86,7 +119,6 @@ impl<'a> FlashWriter<'a> {
     fn lock(&mut self) -> Result<(), Error> {
         while self.flash.sr.sr().read().bsy().is_active() {}
 
-        // why use modify instead of write here? (copied from stm32f1xx hal)
         self.flash.cr.cr().modify(|_, w| w.lock().lock());
 
         match self.flash.cr.cr().read().lock().is_locked() {
@@ -97,6 +129,10 @@ impl<'a> FlashWriter<'a> {
 
     fn unlock(&mut self) -> Result<(), Error> {
         while self.flash.sr.sr().read().bsy().is_active() {}
+
+        if !self.is_locked() {
+            return Ok(());
+        }
 
         self.flash.keyr.keyr().write(|w| w.fkeyr().bits(Self::KEY1));
 
@@ -112,129 +148,108 @@ impl<'a> FlashWriter<'a> {
         self.flash.cr.cr().read().lock().is_locked()
     }
 
-    fn write_word(&mut self, word: u16, destination: *mut u16) -> Result<(), Error> {
-        unsafe {
-            core::ptr::write_volatile(destination, word);
-        };
+    unsafe fn program_half_word(&mut self, halfword: u16, address: *mut u16) -> Result<(), Error> {
+        while self.flash.sr.sr().read().bsy().is_active() {}
 
-        while self.flash.sr.sr().read().bsy().bit_is_set() {}
+        self.flash.cr.cr().modify(|_, w| w.pg().program());
 
-        if self.flash.sr.sr().read().eop().bit_is_set() {
-            self.flash.sr.sr().write(|w| w.eop().clear_bit());
-        } else {
-            self.lock()?;
-            return Err(Error::ProgrammingError);
-        }
-
-        if word != unsafe { core::ptr::read_volatile(destination) } {
-            self.lock()?;
-            return Err(Error::VerifyError);
-        }
-        Ok(())
-    }
-}
-
-impl<'a> FlashWriteErase for FlashWriter<'a> {
-    type WriteEraseError = Error;
-
-    
-
-    // TODO: check what kind of addresses work. Only start address of each page? not stated in RM
-    unsafe fn page_erase(&mut self, start_offset: usize) -> Result<(), Self::WriteEraseError> {
-        if start_offset >= FLASH_LAYOUT.flash_size {
-            return Err(Error::OffsetOutOfBounds);
-        }
-
-        self.unlock()?;
+        address.write_volatile(halfword);
 
         while self.flash.sr.sr().read().bsy().is_active() {}
 
-        self.flash.cr.cr().modify(|_, w| w.per().set_bit());
+        self.flash.cr.cr().modify(|_, w| w.pg().clear_bit());
 
+        if self.flash.sr.sr().read().eop().bit_is_set() {
+            self.flash.sr.sr().modify(|_, w| w.eop().clear_bit());
+        } else {
+            return Err(Error::WriteError);
+        }
+
+
+        Ok(())
+    }
+
+    unsafe fn sector_erase(&mut self, start_offset: u32) -> Result<(), Error> {
+        if start_offset >= FLASH_LAYOUT.flash_size {
+            return Err(Error::OutOfBounds);
+        }
+
+        while self.flash.sr.sr().read().bsy().is_active() {}
+
+        self.flash.cr.cr().modify(|_, w| w.per().page_erase());
 
         self.flash
             .ar
             .ar()
             .write(|w| w.far().bits((FLASH_START + start_offset) as u32));
 
-
-        self.flash.cr.cr().modify(|_, w| w.strt().set_bit());
+        self.flash.cr.cr().modify(|_, w| w.strt().start());
 
         // the stm32f3xx reference manual states having to wait at least one cpu cycle before checking bsy
         cortex_m::asm::delay(1);
 
         while self.flash.sr.sr().read().bsy().is_active() {}
+        self.flash.cr.cr().modify(|_, w| w.per().clear_bit());
 
-        if self.flash.sr.sr().read().eop().bit_is_set() {
-            self.flash.sr.sr().write(|w| w.eop().clear_bit());
+        if self.flash.sr.sr().read().eop().is_event() {
+            self.flash.sr.sr().modify(|_, w| w.eop().reset());
             Ok(())
         } else {
             Err(Error::EraseError)
         }
     }
+}
 
-    
+impl<'a> FlashWriteErase for FlashWriter<'a> {
+    type WriteEraseError = Error;
+    const WRITESIZE: u32 = 2;
+    const ERASESIZE: u32 = FLASH_LAYOUT.sector_size;
 
-    unsafe fn write(&mut self, offset: usize, data: &[u8]) -> Result<(), Self::WriteEraseError> {
-        self.valid_write_length(offset, data.len())?;
+    unsafe fn erase(&mut self, offset: u32, length: u32) -> Result<(), Error> {
+        let page_offset = offset % Self::ERASESIZE;
+
+        // basically this is supposed to be (page_offset + length) / PAGE_SIZE
+        // where the division / is an integer ceiling division (e.g. 3/2 = 2, 1/2 = 1 ...)
+        // because there is no obvious other way to implement that, floor division is used and 1 is added in the end
+        // if exactly one full sector should be written, number of pages has to be 1 -> subtract 1 from page_offset + size_of::<T>()
+        // this works only for length > 0 which is ok to assume as writing something of length 0 is not
+
+        let number_of_pages = (page_offset + length - 1) / Self::ERASESIZE + 1;
+
+        self.unlock()?;
+
+        for i in 0..number_of_pages {
+            self.sector_erase(offset + i * Self::ERASESIZE)?;
+        }
+
+        self.lock()?;
+
+        Ok(())
+    }
+
+    unsafe fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), Error> {
+        self.valid_write_length(offset, data.len() as u32)?;
 
         self.unlock()?;
         let base_address = FLASH_START + offset;
 
         for idx in (0..(data.len() - 1)).step_by(2) {
-            let write_address =
-                (base_address + idx) as *mut u16;
-
-            self.flash.cr.cr().write(|w| w.pg().set_bit());
+            let write_address = (base_address + idx as u32) as *mut u16;
 
             let to_write: u16 = (data[idx] as u16) | (data[idx + 1] as u16) << 8;
 
-            self.write_word(to_write, write_address)?;
-            // unsafe {
-            //     core::ptr::write_volatile(write_address, to_write);
-            // };
-
-            // while self.flash.sr.sr().read().bsy().bit_is_set() {}
-
-            // if self.flash.sr.sr().read().eop().bit_is_set() {
-            //     self.flash.sr.sr().write(|w| w.eop().clear_bit());
-            // } else {
-            //     self.lock()?;
-            //     return Err(Error::ProgrammingError);
-            // }
-
-            // if to_write != unsafe { core::ptr::read_volatile(write_address) } {
-            //     self.lock()?;
-            //     return Err(Error::VerifyError);
-            // }
+            self.program_half_word(to_write, write_address)?;
         }
 
-        let uneven: bool = data.len() % Self::WRITESIZE != 0;
+        let uneven: bool = data.len() as u32 % Self::WRITESIZE != 0;
 
         if uneven {
-            let to_write = *(data.last().unwrap()) as u16 | (0xFF as u16) << 8;
+            let to_write = *(data.last().unwrap()) as u16 | (0xFF) << 8;
 
             // TODO: think about this again, is -1 correct?
-            let address = (base_address + data.len() - 1) as *mut u16;
+            let address = (base_address + data.len() as u32 - 1) as *mut u16;
 
-            self.write_word(to_write, address)?;
-
-
-            // core::ptr::write_volatile(address, to_write);
-
-            // while self.flash.sr.sr().read().bsy().bit_is_set() {}
-
-            // if self.flash.sr.sr().read().eop().bit_is_set() {
-            //     self.flash.sr.sr().write(|w| w.eop().clear_bit());
-            // } else {
-            //     self.lock()?;
-            //     return Err(Error::ProgrammingError);
-            // }
-
-            // if to_write != core::ptr::read_volatile(address) {
-            //     self.lock()?;
-            //     return Err(Error::VerifyError);
-            // }
+            self.program_half_word(to_write, address)?;
         }
 
         self.lock()?;
@@ -242,25 +257,21 @@ impl<'a> FlashWriteErase for FlashWriter<'a> {
     }
 }
 
-
 impl<'a> FlashRead for FlashWriter<'a> {
     type ReadError = Error;
+    const READSIZE: u32 = 1;
 
-    unsafe fn read(&self, offset: usize, buf: &mut [u8]) -> Result<(), Self::ReadError> {
-        self.valid_read_length(offset, buf.len())?;
+    fn read(&self, offset: u32, buf: &mut [u8]) -> Result<(), Error> {
+        self.valid_read_length(offset, buf.len() as u32)?;
 
         let address = (FLASH_START + offset) as *const _;
 
-        // NOTE(unsafe) read with no side effects. The data returned will
-        // remain valid for its lifetime because we take an immutable
-        // reference to this FlashWriter, and any operation that would
-        // invalidate the data returned would first require taking a mutable
-        // reference to this FlashWriter.
-        unsafe { buf.copy_from_slice(core::slice::from_raw_parts(address, buf.len())); }
+        unsafe {
+            buf.copy_from_slice(core::slice::from_raw_parts(address, buf.len()));
+        }
         Ok(())
     }
 }
-
 
 pub trait FlashExt {
     fn constrain(self) -> Parts;
